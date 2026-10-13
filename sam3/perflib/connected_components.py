@@ -69,16 +69,9 @@ def connected_components(input_tensor: torch.Tensor):
         input_tensor.dim() == 4 and input_tensor.shape[1] == 1
     ), "Input tensor must be (B, H, W) or (B, 1, H, W)."
 
-    if input_tensor.is_cuda:
-        if HAS_CC_TORCH:
+    if input_tensor.is_cuda and HAS_CC_TORCH:
+        try:
             return get_connected_components(input_tensor.to(torch.uint8))
-        else:
-            # triton fallback
-            from .triton.connected_components import (
-                connected_components_triton,
-            )
-
-            return connected_components_triton(input_tensor)
-
-    # CPU fallback
+        except Exception:
+            logging.warning("cc_torch failed; using CPU connected_components")
     return connected_components_cpu(input_tensor)

@@ -5,6 +5,8 @@
 import torch
 import triton
 import triton.language as tl
+import numpy as np
+from scipy.ndimage import distance_transform_edt
 
 """
 Disclaimer: This implementation is not meant to be extremely efficient. A CUDA kernel would likely be more efficient.
@@ -47,6 +49,20 @@ The timing obtained on a H100 for a random batch of masks of dimension 256 x 102
 
 Overall, despite being quite naive, this implementation is roughly 5.5x faster than the openCV cpu implem
 
+--------------------------------------------------------------------------------
+RTX 5090 (Blackwell, sm_120) compatibility patch
+--------------------------------------------------------------------------------
+Triton's CUDA kernel compiler does not yet emit valid device code for sm_120
+(Blackwell). Launching the Triton kernel below on such GPUs raises
+"CUDA error: device kernel image is invalid" at runtime (not at import time).
+
+To keep this workflow usable, `edt_triton()` now tries the original Triton
+kernel first (so it will automatically resume using the fast GPU path once
+Triton ships sm_120 support), and transparently falls back to an equivalent
+CPU implementation (scipy.ndimage.distance_transform_edt) if the Triton
+launch fails. The result is numerically equivalent, just slower
+(~15-30ms per call on a 1024x1024 mask vs <1ms on GPU), which is negligible
+compared to the overall video segmentation pipeline runtime.
 """
 
 
@@ -114,19 +130,8 @@ def edt_kernel(inputs_ptr, outputs_ptr, v, z, height, width, horizontal: tl.cons
         tl.store(outputs_ptr + block_start + (q * stride), old_value + d * d)
 
 
-def edt_triton(data: torch.Tensor):
-    """
-    Computes the Euclidean Distance Transform (EDT) of a batch of binary images.
-
-    Args:
-        data: A tensor of shape (B, H, W) representing a batch of binary images.
-
-    Returns:
-        A tensor of the same shape as data containing the EDT.
-        It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
-    """
-    assert data.dim() == 3
-    assert data.is_cuda
+def _edt_triton_gpu(data: torch.Tensor) -> torch.Tensor:
+    """Original GPU implementation using the Triton kernel above."""
     B, H, W = data.shape
     data = data.contiguous()
 
@@ -171,3 +176,67 @@ def edt_triton(data: torch.Tensor):
     )
     # don't forget to take sqrt at the end
     return output.sqrt()
+
+
+def _edt_cpu_fallback(data: torch.Tensor) -> torch.Tensor:
+    """
+    CPU fallback for GPUs where the Triton EDT kernel is unsupported
+    (e.g. RTX 5090 / Blackwell sm_120).
+
+    Numerically equivalent to _edt_triton_gpu / cv2.distanceTransform(input, cv2.DIST_L2, 0):
+    for every pixel, the distance to the closest pixel where data == 0.
+    """
+    original_device = data.device
+    mask_np = data.detach().to("cpu").numpy()
+    B = mask_np.shape[0]
+    out = np.empty(mask_np.shape, dtype=np.float32)
+    for b in range(B):
+        # distance_transform_edt(x) returns, for every position where x is False,
+        # the distance to the nearest True position (and 0 where x is already True).
+        # Passing (mask_np[b] == 0) as x makes "True" == "original pixel is 0",
+        # which reproduces cv2's "distance to closest zero pixel" semantics.
+        bg_mask = mask_np[b] == 0
+        out[b] = distance_transform_edt(bg_mask)
+    return torch.from_numpy(out).to(device=original_device, dtype=torch.float32)
+
+
+# Set to True once we detect that the Triton kernel is unusable on this GPU,
+# so subsequent calls skip straight to the CPU fallback instead of repeatedly
+# paying for a failed CUDA launch.
+_TRITON_EDT_BROKEN = False
+
+
+def edt_triton(data: torch.Tensor):
+    """
+    Computes the Euclidean Distance Transform (EDT) of a batch of binary images.
+
+    Args:
+        data: A tensor of shape (B, H, W) representing a batch of binary images.
+
+    Returns:
+        A tensor of the same shape as data containing the EDT.
+        It should be equivalent to a batched version of cv2.distanceTransform(input, cv2.DIST_L2, 0)
+
+    Note:
+        Transparently falls back to a CPU (scipy) implementation if the Triton
+        GPU kernel fails to launch (e.g. unsupported GPU architecture such as
+        RTX 5090 / Blackwell sm_120 with Triton versions that don't yet emit
+        valid sm_120 device code).
+    """
+    global _TRITON_EDT_BROKEN
+    assert data.dim() == 3
+    assert data.is_cuda
+
+    if not _TRITON_EDT_BROKEN:
+        try:
+            return _edt_triton_gpu(data)
+        except Exception as e:
+            _TRITON_EDT_BROKEN = True
+            print(
+                f"[sam3][edt] Triton EDT kernel failed ({type(e).__name__}: {e}); "
+                "falling back to CPU (scipy) implementation for this and all "
+                "subsequent calls. This is expected on GPUs not yet supported "
+                "by the installed Triton version (e.g. RTX 5090 / Blackwell)."
+            )
+
+    return _edt_cpu_fallback(data)

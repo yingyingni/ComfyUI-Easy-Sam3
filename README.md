@@ -1,5 +1,11 @@
 # ComfyUI-Easy-Sam3
 
+> **Fork notice**: this tree is a patched copy of
+> [yolain/ComfyUI-Easy-Sam3](https://github.com/yolain/ComfyUI-Easy-Sam3)
+> (upstream `88fe578`, Apache-2.0). It adds **sm_120 (RTX 5090 Blackwell)
+> Triton→CPU fallbacks** in 3 files so the nodes run on Blackwell GPUs.
+> See [FORK_PATCHES.md](FORK_PATCHES.md).
+
 [English](README.md) | [中文](README_CN.md)
 
 A ComfyUI custom node package for [SAM3 (Segment Anything Model 3)](https://github.com/facebookresearch/sam3), providing powerful image and video segmentation capabilities with text prompts.

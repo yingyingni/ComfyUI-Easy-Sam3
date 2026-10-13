@@ -60,14 +60,12 @@ def generic_nms(
     assert ious.dim() == 2 and ious.size(0) == ious.size(1)
     assert scores.dim() == 1 and scores.size(0) == ious.size(0)
 
-    if ious.is_cuda:
-        if GENERIC_NMS_AVAILABLE:
+    # RTX 5090: skip Triton NMS (invalid kernel image). Tiny IoU matrix on CPU; SAM3 stays on GPU.
+    if ious.is_cuda and GENERIC_NMS_AVAILABLE:
+        try:
             return generic_nms_cuda(ious, scores, iou_threshold, use_iou_matrix=True)
-        else:
-            from .triton.nms import nms_triton
-
-            return nms_triton(ious, scores, iou_threshold)
-
+        except Exception:
+            logging.warning("torch_generic_nms failed; using CPU NMS")
     return generic_nms_cpu(ious, scores, iou_threshold)
 
 

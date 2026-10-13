@@ -8,3 +8,4 @@ pycocotools>=2.0.10
 numpy>=1.26
 tqdm
 typing_extensions
+scipy
